@@ -14,6 +14,9 @@ import tarfile
 __version__ = "0.4.1"
 
 STRIP_COMMENTS = (re.compile(r"(^|[^\\])%.*"), r"\1%")
+# read the TEXINPUTS environment variable defined in any latexmkrc file
+# e.g. ensure_path("TEXINPUTS", "a", "b", ...)
+FIND_TEX_INPUTS = re.compile(r"^ensure_path\s*\(\s*['\"]TEXINPUTS['\"]\s*,\s*(.*)\s*\)\s*;?\s*$")
 
 ################################################################################
 # General helpers
@@ -66,6 +69,18 @@ def expect_re(seen, pattern, deps_file, error_msg=None):
             msg += error_msg
         raise ValueError(msg)
     return match
+
+def get_texinputs():
+    texinputs = os.environ.get("TEXINPUTS", "")
+    if os.path.isfile("latexmkrc"):
+        with io.open("latexmkrc") as f:
+            for line in f:
+                match = FIND_TEX_INPUTS.search(line)
+                if match:
+                    texinputs = match.group(1) + ":" + texinputs
+                    texinputs = texinputs.split(",")
+                    return [t.replace("\"", "").replace("'", "").strip() for t in texinputs]
+    return texinputs.split(":")
 
 
 ################################################################################
@@ -215,6 +230,8 @@ def collect(
             info("    as", arcname)
         out_tar.add(dest, arcname=arcname, **kwargs)
 
+    texinputs = get_texinputs()
+
     with io.open(deps_file, "rt") as f:
         lines = iter(f)
 
@@ -255,11 +272,21 @@ def collect(
             if dep.endswith("\\"):
                 dep = dep[:-1]
 
+            abs_dep = os.path.isabs(dep)
+            arcname = dep if not abs_dep else os.path.basename(dep)
+            # search if the dep path is in texinputs
+            # e.g. if ../../tex is in texinputs, then ../../tex/foo/bar.sty
+            # becomes foo/bar.sty
+            for texinput in texinputs:
+                if dep.startswith(texinput):
+                    arcname = dep[len(texinput):]
+                    break
+
             lowlevel("Processing", dep, "...")
 
-            if os.path.isabs(dep):
+            if abs_dep:
                 if pkg_re.search(dep):
-                    add(dep, arcname=os.path.basename(dep))
+                    add(dep, arcname=arcname)
 
             elif dep.endswith(".tex") and tex_replace:
                 if any(excl.match(dep) for excl in exclude_files):
@@ -267,7 +294,7 @@ def collect(
                     continue
 
                 with io.open(dep) as f, io.BytesIO() as g:
-                    tarinfo = tarfile.TarInfo(name=dep)
+                    tarinfo = tarfile.TarInfo(name=arcname)
                     for line in f:
                         for pat, rep in tex_replace:
                             line = re.sub(pat, rep, line)
@@ -295,10 +322,10 @@ def collect(
             elif dep.endswith(".bib"):
                 used_bib = True
                 if include_bib:
-                    add(dep)
+                    add(dep, arcname=arcname)
 
             else:
-                add(dep)
+                add(dep, arcname=arcname)
         else:
             # hit end of file without the break...
             expect(line, end_lines, deps_file)
